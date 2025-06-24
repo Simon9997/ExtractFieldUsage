@@ -1,0 +1,83 @@
+#include "clang/AST/AST.h"
+#include "clang/Frontend/FrontendActions.h"
+#include "clang/Tooling/CommonOptionsParser.h"
+#include "clang/Tooling/Tooling.h"
+#include "clang/ASTMatchers/ASTMatchers.h"
+#include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
+#include <nlohmann/json.hpp>
+#include <iostream>
+#include <fstream>
+#include <set>
+
+using namespace clang;
+using namespace clang::tooling;
+using namespace clang::ast_matchers;
+using json = nlohmann::json;
+
+static llvm::cl::OptionCategory ToolCategory("field-usage-checker");
+static llvm::cl::opt<std::string> FieldJsonPath("field-json", llvm::cl::desc("Path to struct_fields.json"), llvm::cl::value_desc("filename"), llvm::cl::Required, llvm::cl::cat(ToolCategory));
+static llvm::cl::opt<std::string> OutputJsonPath("output-json", llvm::cl::desc("Output JSON file path"), llvm::cl::value_desc("filename"), llvm::cl::Required, llvm::cl::cat(ToolCategory));
+static llvm::cl::extrahelp CommonHelp(CommonOptionsParser::HelpMessage);
+
+json structFields;
+
+class FieldUsageCollector : public MatchFinder::MatchCallback {
+public:
+    json used;
+
+    void run(const MatchFinder::MatchResult &Result) override {
+        const MemberExpr *member = Result.Nodes.getNodeAs<MemberExpr>("fieldUse");
+        if (member && isa<FieldDecl>(member->getMemberDecl())) {
+            const FieldDecl *field = cast<FieldDecl>(member->getMemberDecl());
+            const RecordDecl *parent = dyn_cast<RecordDecl>(field->getParent());
+            if (!parent) return;
+            std::string structName = parent->getNameAsString();
+            if (structFields.contains(structName)) {
+                std::string fieldName = field->getNameAsString();
+                used[structName].push_back(fieldName);
+            }
+        }
+    }
+};
+
+int main(int argc, const char **argv) {
+    auto ExpectedParser = CommonOptionsParser::create(argc, argv, ToolCategory, llvm::cl::Optional, nullptr);
+    if (!ExpectedParser) {
+        llvm::errs() << "Failed to parse command-line arguments: " << llvm::toString(ExpectedParser.takeError()) << "\n";
+        return 1;
+    }
+
+    std::ifstream f(FieldJsonPath);
+    if (!f) {
+        llvm::errs() << "Failed to open struct_fields.json file.\n";
+        return 1;
+    }
+    f >> structFields;
+
+    CommonOptionsParser &OptionsParser = ExpectedParser.get();
+    ClangTool Tool(OptionsParser.getCompilations(), OptionsParser.getSourcePathList());
+
+    FieldUsageCollector collector;
+    MatchFinder finder;
+    finder.addMatcher(memberExpr(isArrow(), member(fieldDecl())).bind("fieldUse"), &collector);
+    finder.addMatcher(memberExpr(member(fieldDecl())).bind("fieldUse"), &collector);
+
+    auto result = Tool.run(newFrontendActionFactory(&finder).get());
+    if (result != 0) {
+        llvm::errs() << "Tool execution failed.\n";
+        return result;
+    }
+
+    for (auto& [k, v] : collector.used.items()) {
+        std::set<std::string> s(v.begin(), v.end());
+        collector.used[k] = json::array();
+        for (const auto& f : s) collector.used[k].push_back(f);
+    }
+
+    std::ofstream ofs(OutputJsonPath);
+    ofs << collector.used.dump(2);
+    return 0;
+}
+
